@@ -1,0 +1,8 @@
+[API]
+URL = https://api.siliconflow.cn
+KEY = YOUR_API_KEY
+MODEL = FunAudioLLM/SenseVoiceSmall
+
+[BASE]
+result = 语音转文字结果.jsonl
+cutmessages = 4000
