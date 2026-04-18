@@ -5,4 +5,5 @@ MODEL = FunAudioLLM/SenseVoiceSmall
 
 [BASE]
 result = 语音转文字结果.jsonl
-cutmessages = 4000
+retry_count = 3
+retry_interval = 2
