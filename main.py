@@ -7,6 +7,7 @@ import re
 import html
 import shutil
 import time
+import signal
 from pathlib import Path
 from datetime import datetime
 
@@ -128,241 +129,238 @@ def transcribe_audio(file_path, api_url, api_key, model, retry_count=3, retry_in
     return ''
 
 
-def save_result(file_name, text, result_file):
+# 全局变量用于跟踪进度和保存状态
+interrupted = False
+html_contents = {}  # 内存中缓存的HTML内容
+
+def signal_handler(signum, frame):
+    """处理中断信号"""
+    global interrupted
+    if not interrupted:
+        interrupted = True
+        print(f"\n{Colors.WARNING}\n⚠ 收到中断信号，正在保存进度...{Colors.ENDC}")
+        save_all_html_contents()
+        print_success("进度已保存，程序即将退出")
+        sys.exit(0)
+
+
+def register_signal_handler():
+    """注册中断信号处理器"""
     try:
-        with open(result_file, 'a', encoding='utf-8') as f:
-            result = {
-                'name': file_name,
-                'result': text
-            }
-            f.write(json.dumps(result, ensure_ascii=False) + '\n')
-        print_success(f"结果已保存: {file_name}")
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
     except Exception as e:
-        print_error(f"保存结果时出错: {e}")
+        print_warning(f"无法注册信号处理器: {e}")
 
 
-def init_result_file(result_file):
+def save_all_html_contents():
+    """保存所有内存中的HTML内容到硬盘"""
+    global html_contents
+    for html_path, content in html_contents.items():
+        try:
+            html_path.write_text(content, encoding="utf-8")
+            print_info(f"已保存进度: {html_path.name}")
+        except Exception as e:
+            print_error(f"保存 {html_path.name} 时出错: {e}")
+
+
+def delete_wav_file(wav_path):
+    """删除原始音频文件"""
     try:
-        if os.path.exists(result_file) and os.path.getsize(result_file) > 0:
-            backup_file = create_backup(result_file)
-            print_info(f"已备份原始结果文件: {backup_file}")
-        
-        with open(result_file, 'w', encoding='utf-8') as f:
-            pass
-        print_info(f"结果文件已初始化: {result_file}")
-    except Exception as e:
-        print_error(f"初始化结果文件时出错: {e}")
-
-
-def create_backup(file_path):
-    """为文件创建备份，添加时间戳"""
-    file_dir = os.path.dirname(file_path)
-    file_name = os.path.basename(file_path)
-    name, ext = os.path.splitext(file_name)
-    
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    backup_name = f"{name}_backup_{timestamp}{ext}"
-    backup_path = os.path.join(file_dir, backup_name)
-    
-    shutil.copy2(file_path, backup_path)
-    return backup_path
-
-
-def delete_result_file(result_file):
-    """删除语音转文字结果文件"""
-    try:
-        if os.path.exists(result_file):
-            os.remove(result_file)
-            print_success(f"已删除结果文件: {os.path.basename(result_file)}")
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
+            print_success(f"已删除原始音频: {os.path.basename(wav_path)}")
             return True
         return False
     except Exception as e:
-        print_error(f"删除结果文件时出错: {e}")
+        print_error(f"删除音频文件时出错: {e}")
         return False
 
 
-def load_results(result_path):
-    """加载语音转文字结果"""
-    print_section(f"加载语音转文字结果文件: {result_path.name}")
-    results = {}
-    line_count = 0
-    success_count = 0
-    error_count = 0
-    
-    with result_path.open("r", encoding="utf-8") as handle:
-        for line_no, line in enumerate(handle, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            line_count += 1
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as exc:
-                print_error(f"第 {line_no} 行 JSON 解析失败: {exc}")
-                error_count += 1
-                continue
-            name = record.get("name")
-            result_text = record.get("result")
-            if not name or result_text is None:
-                continue
-            results[name] = str(result_text).strip()
-            success_count += 1
-    
-    print_info(f"总行数: {line_count}")
-    print_success(f"成功解析: {success_count} 条")
-    print_error(f"解析失败: {error_count} 条")
-    print_info(f"有效结果: {len(results)} 个")
-    return results
-
-
-def replace_voice_messages(content, results):
-    """替换HTML中的语音消息"""
+def replace_single_voice_message(html_content, wav_name, text):
+    """在内存中替换单个语音消息"""
     marker = "window.WEFLOW_DATA = ["
-    start_index = content.find(marker)
+    start_index = html_content.find(marker)
     if start_index == -1:
-        return content, 0, 0
+        return html_content, False
 
     array_start = start_index + len(marker)
-    array_end = content.find("];", array_start)
+    array_end = html_content.find("];", array_start)
     if array_end == -1:
-        return content, 0, 0
+        return html_content, False
 
-    array_body = content[array_start:array_end].strip()
+    array_body = html_content[array_start:array_end].strip()
     if array_body:
         json_text = "[" + array_body.rstrip(",") + "]"
         try:
             items = json.loads(json_text)
         except json.JSONDecodeError as exc:
             print_error(f"HTML 数据解析失败: {exc}")
-            return content, 0, 0
+            return html_content, False
     else:
         items = []
 
-    total_voice = 0
-    updated = 0
-    no_match_count = 0
-    no_result_count = 0
-    
+    modified = False
     for item in items:
         body = item.get("b")
         if not isinstance(body, str):
             continue
         if "[语音消息]" not in body:
             continue
-        total_voice += 1
         match = re.search(r'src="([^"]+\.wav)"', body)
         if not match:
-            no_match_count += 1
             continue
-        wav_name = Path(match.group(1)).name
-        result_text = results.get(wav_name)
-        if not result_text:
-            no_result_count += 1
-            continue
-        safe_text = html.escape(result_text, quote=True)
-        new_body = body.replace("[语音消息]", f"[语音转文字-{safe_text}]")
-        if new_body != body:
-            item["b"] = new_body
-            updated += 1
+        match_wav_name = Path(match.group(1)).name
+        if match_wav_name == wav_name:
+            safe_text = html.escape(text, quote=True)
+            new_body = body.replace("[语音消息]", f"[语音转文字-{safe_text}]")
+            if new_body != body:
+                item["b"] = new_body
+                modified = True
+                break
 
-    print_info(f"总消息数: {len(items)} 条")
-    print_info(f"语音消息: {total_voice} 条")
-    print_success(f"成功替换: {updated} 条")
-    print_warning(f"未匹配wav: {no_match_count} 条")
-    print_warning(f"无转写结果: {no_result_count} 条")
+    if modified:
+        new_array = ",\n".join(json.dumps(item, ensure_ascii=False) for item in items)
+        html_content = html_content[:start_index] + marker + "\n" + new_array + "\n" + html_content[array_end:]
 
-    new_array = ",\n".join(json.dumps(item, ensure_ascii=False) for item in items)
-    new_content = content[:start_index] + marker + "\n" + new_array + "\n" + content[array_end:]
-    return new_content, updated, total_voice
+    return html_content, modified
 
 
-def process_html_files(base_path, results, batch_mode=False):
-    """处理HTML文件"""
-    print_section("处理 HTML 文件")
+def load_html_files(base_path):
+    """加载HTML文件到内存"""
+    global html_contents
+    print_section("加载 HTML 文件到内存")
     
     html_files = sorted(base_path.glob("*.html"))
     if not html_files:
         print_error("当前文件夹中未找到 HTML 文件")
-        return 0, 0
+        return []
 
     print_info(f"找到 {len(html_files)} 个 HTML 文件")
     
     for html_file in html_files:
-        print(f"  - {html_file.name}")
+        try:
+            content = html_file.read_text(encoding="utf-8")
+            html_contents[html_file] = content
+            print_info(f"  ✓ {html_file.name}")
+        except Exception as e:
+            print_error(f"  ✗ 加载 {html_file.name} 失败: {e}")
+    
+    return list(html_contents.keys())
+
+
+def update_html_in_memory(wav_name, text):
+    """在内存中更新所有HTML文件中的语音消息"""
+    global html_contents
+    updated_count = 0
+    
+    for html_path, content in html_contents.items():
+        new_content, modified = replace_single_voice_message(content, wav_name, text)
+        if modified:
+            html_contents[html_path] = new_content
+            updated_count += 1
+            print_info(f"  更新了 {html_path.name}")
+    
+    return updated_count
+
+
+def finalize_html_files(batch_mode=False):
+    """将内存中的HTML内容写入硬盘"""
+    global html_contents
+    
+    if not html_contents:
+        return 0
     
     if not batch_mode:
-        print(f"\n{Colors.WARNING}{Colors.BOLD}⚠ 警告: 即将修改HTML文件！{Colors.ENDC}")
-        print(f"{Colors.WARNING}建议在修改前备份HTML文件{Colors.ENDC}")
-        print(f"\n{Colors.OKCYAN}是否继续处理HTML文件？(y/n): {Colors.ENDC}", end="")
+        print(f"\n{Colors.WARNING}{Colors.BOLD}⚠ 警告: 即将保存HTML文件！{Colors.ENDC}")
+        print(f"{Colors.WARNING}建议在保存前备份HTML文件{Colors.ENDC}")
+        print(f"\n{Colors.OKCYAN}是否继续保存HTML文件？(y/n): {Colors.ENDC}", end="")
         
         confirm = input().strip().lower()
         if confirm != 'y':
-            print_warning("用户取消操作，跳过HTML文件处理")
-            return 0, 0
+            print_warning("用户取消操作，跳过HTML保存")
+            return 0
     else:
         print_info(f"{Colors.OKGREEN}批量处理模式: 自动跳过确认{Colors.ENDC}")
 
-    total_updated = 0
-    total_voice = 0
+    saved_count = 0
+    for html_path, content in html_contents.items():
+        try:
+            html_path.write_text(content, encoding="utf-8")
+            print_success(f"  ✓ 已保存: {html_path.name}")
+            saved_count += 1
+        except Exception as e:
+            print_error(f"  ✗ 保存 {html_path.name} 失败: {e}")
     
-    for idx, html_path in enumerate(html_files, start=1):
-        print(f"\n[{idx}/{len(html_files)}] 处理文件: {html_path.name}")
-        print(f"{Colors.OKCYAN}{'-'*60}{Colors.ENDC}")
-        
-        original = html_path.read_text(encoding="utf-8")
-        updated_content, updated, total = replace_voice_messages(original, results)
-        
-        if updated_content != original:
-            html_path.write_text(updated_content, encoding="utf-8")
-            print_success(f"文件已更新")
-        else:
-            print_info(f"文件无需更新")
-        
-        total_updated += updated
-        total_voice += total
-
-    return total_updated, total_voice
+    return saved_count
 
 
-def transcribe_wav_files(config, base_path, result_file):
-    """转写WAV文件"""
-    print_section("语音转文字")
+def transcribe_and_update(config, base_path):
+    """转写WAV文件并立即更新HTML（优化后的流程）"""
+    global interrupted
+    print_section("语音转文字（优化模式）")
     
     api_url = config.get('API', 'URL')
     api_key = config.get('API', 'KEY')
     model = config.get('API', 'MODEL')
     retry_count = config.getint('BASE', 'retry_count', fallback=3)
     retry_interval = config.getint('BASE', 'retry_interval', fallback=2)
+    delete_wav_after = config.getboolean('BASE', 'delete_wav_after_transcribe', fallback=True)
     
     print_info(f"API URL: {api_url}")
     print_info(f"模型: {model}")
-    print_info(f"结果文件: {result_file}")
     print_info(f"重试次数: {retry_count}")
     print_info(f"重试间隔: {retry_interval} 秒")
+    print_info(f"转写后删除原音频: {'是' if delete_wav_after else '否'}")
+    
+    # 加载HTML文件到内存
+    html_files = load_html_files(base_path)
+    if not html_files:
+        print_error("没有找到HTML文件，无法继续")
+        return 0, 0, 0
     
     wav_files = get_wav_files(base_path)
     print_info(f"找到 {len(wav_files)} 个WAV文件")
     
     if not wav_files:
         print_warning("没有找到WAV文件")
-        return False
-    
-    init_result_file(result_file)
+        return 0, 0, 0
     
     success_count = 0
     failed_count = 0
+    updated_count = 0
+    deleted_count = 0
     
     for idx, wav_file in enumerate(wav_files, start=1):
+        # 检查是否被中断
+        if interrupted:
+            print_warning("检测到中断，停止处理")
+            break
+        
         file_name = os.path.basename(wav_file)
         print(f"\n[{idx}/{len(wav_files)}] 正在处理: {file_name}")
+        
+        # 转写音频
         text = transcribe_audio(wav_file, api_url, api_key, model, retry_count, retry_interval)
         
         if text:
-            save_result(file_name, text, result_file)
             print_success(f"转写成功: {text[:50]}...")
+            
+            # 立即在内存中更新HTML
+            updated = update_html_in_memory(file_name, text)
+            if updated > 0:
+                updated_count += updated
+            
+            # 根据配置决定是否删除原始音频文件
+            if delete_wav_after:
+                if delete_wav_file(wav_file):
+                    deleted_count += 1
+            else:
+                print_info(f"保留原始音频: {file_name}")
+            
             success_count += 1
         else:
-            print_error(f"转写失败")
+            print_error(f"转写失败，保留原始文件")
             failed_count += 1
     
     print(f"\n{Colors.OKCYAN}{'-'*60}{Colors.ENDC}")
@@ -371,33 +369,36 @@ def transcribe_wav_files(config, base_path, result_file):
     if failed_count > 0:
         print_error(f"失败: {failed_count} 个")
     print_info(f"总计: {len(wav_files)} 个文件")
+    print_success(f"累计更新HTML: {updated_count} 处")
+    if delete_wav_after:
+        print_info(f"已删除原音频: {deleted_count} 个")
     
-    return success_count > 0
+    return success_count, failed_count, updated_count
 
 
 def process_single_directory(config, base_path, batch_mode=False):
-    """处理单个目录"""
-    result_file = base_path / config.get('BASE', 'result')
+    """处理单个目录（优化后）"""
+    global html_contents
     
-    success = transcribe_wav_files(config, base_path, result_file)
+    # 重置内存中的HTML内容
+    html_contents = {}
     
-    if success:
-        results = load_results(result_file)
+    # 转写并立即更新内存中的HTML
+    success_count, failed_count, updated_count = transcribe_and_update(config, base_path)
+    
+    if success_count > 0:
+        # 最终保存HTML文件到硬盘
+        saved_count = finalize_html_files(batch_mode)
         
-        if results:
-            total_updated, total_voice = process_html_files(base_path, results, batch_mode)
-            
-            print(f"\n{Colors.OKCYAN}{'-'*60}{Colors.ENDC}")
-            delete_result_file(result_file)
-            
-            return total_updated, total_voice
-        else:
-            print_error("未找到语音转文字结果")
-            delete_result_file(result_file)
-            return 0, 0
+        print(f"\n{Colors.OKCYAN}{'-'*60}{Colors.ENDC}")
+        print_success(f"处理完成！")
+        print_info(f"成功转写: {success_count} 个")
+        print_info(f"成功更新HTML: {updated_count} 处")
+        print_info(f"成功保存文件: {saved_count} 个")
+        
+        return updated_count, success_count + failed_count
     else:
-        print_error("语音转写失败，跳过HTML替换")
-        delete_result_file(result_file)
+        print_error("语音转写失败")
         return 0, 0
 
 
@@ -451,7 +452,10 @@ def process_batch_directories(config, root_path):
 
 
 def main():
-    print_header("语音转文字与HTML替换工具")
+    # 注册中断信号处理器
+    register_signal_handler()
+    
+    print_header("语音转文字与HTML替换工具（优化版）")
     
     print(f"\n{Colors.OKCYAN}请选择处理模式:{Colors.ENDC}")
     print(f"  {Colors.OKGREEN}1{Colors.ENDC}. 直接识别处理当前目录")
@@ -469,7 +473,7 @@ def main():
             total_updated, total_voice = process_single_directory(config, base_path, batch_mode=False)
             
             print_header("处理完成")
-            print_info(f"语音消息总数: {total_voice} 条")
+            print_info(f"语音文件总数: {total_voice} 个")
             print_success(f"成功替换总数: {total_updated} 条")
         
         elif choice == '2':
@@ -487,7 +491,7 @@ def main():
             print_success(f"成功处理: {success_dirs} 个")
             if failed_dirs > 0:
                 print_error(f"失败: {failed_dirs} 个")
-            print_info(f"语音消息总数: {total_voice} 条")
+            print_info(f"语音文件总数: {total_voice} 个")
             print_success(f"成功替换总数: {total_updated} 条")
         
         else:
