@@ -129,18 +129,16 @@ def transcribe_audio(file_path, api_url, api_key, model, retry_count=3, retry_in
     return ''
 
 
-# 全局变量用于跟踪进度和保存状态
+# 全局变量用于跟踪进度
 interrupted = False
-html_contents = {}  # 内存中缓存的HTML内容
 
 def signal_handler(signum, frame):
     """处理中断信号"""
     global interrupted
     if not interrupted:
         interrupted = True
-        print(f"\n{Colors.WARNING}\n⚠ 收到中断信号，正在保存进度...{Colors.ENDC}")
-        save_all_html_contents()
-        print_success("进度已保存，程序即将退出")
+        print(f"\n{Colors.WARNING}\n⚠ 收到中断信号，程序即将退出{Colors.ENDC}")
+        print_info("已转换的结果已自动保存到文件")
         sys.exit(0)
 
 
@@ -153,15 +151,7 @@ def register_signal_handler():
         print_warning(f"无法注册信号处理器: {e}")
 
 
-def save_all_html_contents():
-    """保存所有内存中的HTML内容到硬盘"""
-    global html_contents
-    for html_path, content in html_contents.items():
-        try:
-            html_path.write_text(content, encoding="utf-8")
-            print_info(f"已保存进度: {html_path.name}")
-        except Exception as e:
-            print_error(f"保存 {html_path.name} 时出错: {e}")
+
 
 
 def delete_wav_file(wav_path):
@@ -227,9 +217,8 @@ def replace_single_voice_message(html_content, wav_name, text):
 
 
 def load_html_files(base_path):
-    """加载HTML文件到内存"""
-    global html_contents
-    print_section("加载 HTML 文件到内存")
+    """获取HTML文件列表"""
+    print_section("扫描 HTML 文件")
     
     html_files = sorted(base_path.glob("*.html"))
     if not html_files:
@@ -237,68 +226,46 @@ def load_html_files(base_path):
         return []
 
     print_info(f"找到 {len(html_files)} 个 HTML 文件")
-    
     for html_file in html_files:
-        try:
-            content = html_file.read_text(encoding="utf-8")
-            html_contents[html_file] = content
-            print_info(f"  ✓ {html_file.name}")
-        except Exception as e:
-            print_error(f"  ✗ 加载 {html_file.name} 失败: {e}")
+        print_info(f"  ✓ {html_file.name}")
     
-    return list(html_contents.keys())
+    return html_files
 
 
-def update_html_in_memory(wav_name, text):
-    """在内存中更新所有HTML文件中的语音消息"""
-    global html_contents
+def update_html_files(html_files, wav_name, text):
+    """直接更新HTML文件中的语音消息（立即写入磁盘）"""
     updated_count = 0
     
-    for html_path, content in html_contents.items():
-        new_content, modified = replace_single_voice_message(content, wav_name, text)
-        if modified:
-            html_contents[html_path] = new_content
-            updated_count += 1
-            print_info(f"  更新了 {html_path.name}")
+    for html_path in html_files:
+        try:
+            # 读取文件
+            content = html_path.read_text(encoding="utf-8")
+            
+            # 修改内容
+            new_content, modified = replace_single_voice_message(content, wav_name, text)
+            
+            if modified:
+                # 立即写回文件
+                html_path.write_text(new_content, encoding="utf-8")
+                updated_count += 1
+                print_success(f"  ✓ 更新并保存: {html_path.name}")
+        except Exception as e:
+            print_error(f"  ✗ 更新 {html_path.name} 失败: {e}")
     
     return updated_count
 
 
 def finalize_html_files(batch_mode=False):
-    """将内存中的HTML内容写入硬盘"""
-    global html_contents
-    
-    if not html_contents:
-        return 0
-    
+    """最终确认（由于已实时保存，此函数仅用于显示提示）"""
     if not batch_mode:
-        print(f"\n{Colors.WARNING}{Colors.BOLD}⚠ 警告: 即将保存HTML文件！{Colors.ENDC}")
-        print(f"{Colors.WARNING}建议在保存前备份HTML文件{Colors.ENDC}")
-        print(f"\n{Colors.OKCYAN}是否继续保存HTML文件？(y/n): {Colors.ENDC}", end="")
-        
-        confirm = input().strip().lower()
-        if confirm != 'y':
-            print_warning("用户取消操作，跳过HTML保存")
-            return 0
-    else:
-        print_info(f"{Colors.OKGREEN}批量处理模式: 自动跳过确认{Colors.ENDC}")
-
-    saved_count = 0
-    for html_path, content in html_contents.items():
-        try:
-            html_path.write_text(content, encoding="utf-8")
-            print_success(f"  ✓ 已保存: {html_path.name}")
-            saved_count += 1
-        except Exception as e:
-            print_error(f"  ✗ 保存 {html_path.name} 失败: {e}")
-    
-    return saved_count
+        print(f"\n{Colors.OKGREEN}{Colors.BOLD}✓ 所有转换结果已实时保存到文件{Colors.ENDC}")
+    return 0
 
 
 def transcribe_and_update(config, base_path):
-    """转写WAV文件并立即更新HTML（优化后的流程）"""
+    """转写WAV文件并立即更新HTML文件（实时保存）"""
     global interrupted
-    print_section("语音转文字（优化模式）")
+    print_section("语音转文字（实时保存模式）")
     
     api_url = config.get('API', 'URL')
     api_key = config.get('API', 'KEY')
@@ -313,7 +280,7 @@ def transcribe_and_update(config, base_path):
     print_info(f"重试间隔: {retry_interval} 秒")
     print_info(f"转写后删除原音频: {'是' if delete_wav_after else '否'}")
     
-    # 加载HTML文件到内存
+    # 获取HTML文件列表
     html_files = load_html_files(base_path)
     if not html_files:
         print_error("没有找到HTML文件，无法继续")
@@ -346,8 +313,8 @@ def transcribe_and_update(config, base_path):
         if text:
             print_success(f"转写成功: {text[:50]}...")
             
-            # 立即在内存中更新HTML
-            updated = update_html_in_memory(file_name, text)
+            # 立即更新HTML文件（直接写入磁盘）
+            updated = update_html_files(html_files, file_name, text)
             if updated > 0:
                 updated_count += updated
             
@@ -377,24 +344,19 @@ def transcribe_and_update(config, base_path):
 
 
 def process_single_directory(config, base_path, batch_mode=False):
-    """处理单个目录（优化后）"""
-    global html_contents
-    
-    # 重置内存中的HTML内容
-    html_contents = {}
-    
-    # 转写并立即更新内存中的HTML
+    """处理单个目录（实时保存模式）"""
+    # 转写并立即更新HTML文件（实时保存到磁盘）
     success_count, failed_count, updated_count = transcribe_and_update(config, base_path)
     
     if success_count > 0:
-        # 最终保存HTML文件到硬盘
-        saved_count = finalize_html_files(batch_mode)
+        # 最终确认提示
+        finalize_html_files(batch_mode)
         
         print(f"\n{Colors.OKCYAN}{'-'*60}{Colors.ENDC}")
         print_success(f"处理完成！")
         print_info(f"成功转写: {success_count} 个")
         print_info(f"成功更新HTML: {updated_count} 处")
-        print_info(f"成功保存文件: {saved_count} 个")
+        print_info(f"所有结果已实时保存到文件")
         
         return updated_count, success_count + failed_count
     else:
