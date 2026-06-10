@@ -1,9 +1,11 @@
 [API]
 URL = https://api.siliconflow.cn
-KEY = YOUR_API_KEY
-MODEL = FunAudioLLM/SenseVoiceSmall
+KEY = 
+MODEL = TeleAI/TeleSpeechASR
 
 [BASE]
 result = 语音转文字结果.jsonl
 retry_count = 3
 retry_interval = 2
+delete_wav_after_transcribe = true
+concurrency = 3
