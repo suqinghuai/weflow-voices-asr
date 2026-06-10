@@ -91,11 +91,13 @@ def transcribe_audio(file_path, api_url, api_key, model, retry_count=3, retry_in
         'Authorization': f'Bearer {api_key}'
     }
     
+    file_name = os.path.basename(file_path)
+    
     for attempt in range(retry_count):
         try:
             with open(file_path, 'rb') as audio_file:
                 files = {
-                    'file': (os.path.basename(file_path), audio_file, 'audio/wav')
+                    'file': (file_name, audio_file, 'audio/wav')
                 }
                 data = {
                     'model': model
@@ -108,26 +110,25 @@ def transcribe_audio(file_path, api_url, api_key, model, retry_count=3, retry_in
                 text = result.get('text', '')
                 
                 if text:
-                    if attempt > 0:
-                        print_success(f"重试成功 (第{attempt + 1}次尝试)")
                     return text
                 else:
-                    print_warning(f"返回结果为空 (第{attempt + 1}次尝试)")
+                    with print_lock:
+                        print_warning(f"[{file_name}] 返回结果为空 (第{attempt + 1}次尝试)")
                     if attempt < retry_count - 1:
-                        print_info(f"等待 {retry_interval} 秒后重试...")
                         time.sleep(retry_interval)
         except requests.exceptions.RequestException as e:
-            print_error(f"请求失败 (第{attempt + 1}次尝试): {e}")
+            with print_lock:
+                print_error(f"[{file_name}] 请求失败 (第{attempt + 1}次尝试)")
             if attempt < retry_count - 1:
-                print_info(f"等待 {retry_interval} 秒后重试...")
                 time.sleep(retry_interval)
         except Exception as e:
-            print_error(f"处理文件时出错 (第{attempt + 1}次尝试): {e}")
+            with print_lock:
+                print_error(f"[{file_name}] 处理出错 (第{attempt + 1}次尝试)")
             if attempt < retry_count - 1:
-                print_info(f"等待 {retry_interval} 秒后重试...")
                 time.sleep(retry_interval)
     
-    print_error(f"重试 {retry_count} 次后仍然失败")
+    with print_lock:
+        print_error(f"[{file_name}] 重试 {retry_count} 次后失败")
     return ''
 
 
@@ -165,11 +166,11 @@ def delete_wav_file(wav_path):
     try:
         if os.path.exists(wav_path):
             os.remove(wav_path)
-            print_success(f"已删除原始音频: {os.path.basename(wav_path)}")
             return True
         return False
     except Exception as e:
-        print_error(f"删除音频文件时出错: {e}")
+        with print_lock:
+            print_error(f"删除音频文件时出错: {os.path.basename(wav_path)}")
         return False
 
 
@@ -244,19 +245,21 @@ def update_html_files(html_files, wav_name, text):
     
     for html_path in html_files:
         try:
-            # 读取文件
-            content = html_path.read_text(encoding="utf-8")
-            
-            # 修改内容
-            new_content, modified = replace_single_voice_message(content, wav_name, text)
-            
-            if modified:
-                # 立即写回文件
-                html_path.write_text(new_content, encoding="utf-8")
-                updated_count += 1
-                print_success(f"  ✓ 更新并保存: {html_path.name}")
+            # 使用锁保护文件读写，避免并发冲突
+            with print_lock:
+                # 读取文件
+                content = html_path.read_text(encoding="utf-8")
+                
+                # 修改内容
+                new_content, modified = replace_single_voice_message(content, wav_name, text)
+                
+                if modified:
+                    # 立即写回文件
+                    html_path.write_text(new_content, encoding="utf-8")
+                    updated_count += 1
         except Exception as e:
-            print_error(f"  ✗ 更新 {html_path.name} 失败: {e}")
+            with print_lock:
+                print_error(f"更新 {html_path.name} 失败: {e}")
     
     return updated_count
 
@@ -292,16 +295,15 @@ def process_wav_file(wav_file, api_url, api_key, model, retry_count, retry_inter
             if delete_wav_file(wav_file):
                 deleted = 1
         
-        # 输出结果（使用锁保证输出有序）
+        # 实时输出结果（使用锁保证输出有序）
         with print_lock:
-            print(f"  [{file_index}/{total_files}] {Colors.OKGREEN}✓{Colors.ENDC} {file_name}")
-            print(f"    {Colors.OKCYAN}→{Colors.ENDC} {text[:60]}{'...' if len(text) > 60 else ''}")
+            print(f"  [{file_index}/{total_files}] {Colors.OKGREEN}✓{Colors.ENDC} {file_name} {Colors.OKCYAN}{text[:10]}{'...' if len(text) > 10 else ''}{Colors.ENDC}")
         
         return file_name, text, updated, deleted
     else:
+        # 实时输出失败结果
         with print_lock:
             print(f"  [{file_index}/{total_files}] {Colors.FAIL}✗{Colors.ENDC} {file_name}")
-            print(f"    {Colors.FAIL}→{Colors.ENDC} 转写失败")
         
         return file_name, None, 0, 0
 
@@ -368,10 +370,7 @@ def transcribe_and_update(config, base_path):
                 futures[future] = wav_file
             
             # 收集结果
-            completed_count = 0
             for future in as_completed(futures):
-                completed_count += 1
-                
                 if interrupted:
                     executor.shutdown(wait=False)
                     break
@@ -391,7 +390,7 @@ def transcribe_and_update(config, base_path):
                         print_error(f"处理文件时发生异常: {e}")
                     failed_count += 1
         
-        print(f"\n{Colors.OKCYAN}{'-'*60}{Colors.ENDC}")
+        print(f"{Colors.OKCYAN}{'-'*60}{Colors.ENDC}")
     else:
         # 串行处理模式
         print_section(f"开始串行处理")
@@ -411,8 +410,7 @@ def transcribe_and_update(config, base_path):
             text = transcribe_audio(wav_file, api_url, api_key, model, retry_count, retry_interval)
             
             if text:
-                print(f"  [{idx}/{total_files}] {Colors.OKGREEN}✓{Colors.ENDC} {file_name}")
-                print(f"    {Colors.OKCYAN}→{Colors.ENDC} {text[:60]}{'...' if len(text) > 60 else ''}")
+                print(f"  [{idx}/{total_files}] {Colors.OKGREEN}✓{Colors.ENDC} {file_name} {Colors.OKCYAN}{text[:10]}{'...' if len(text) > 10 else ''}{Colors.ENDC}")
                 
                 # 立即更新HTML文件（直接写入磁盘）
                 updated = update_html_files(html_files, file_name, text)
