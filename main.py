@@ -10,6 +10,8 @@ import time
 import signal
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 
 class Colors:
@@ -131,6 +133,10 @@ def transcribe_audio(file_path, api_url, api_key, model, retry_count=3, retry_in
 
 # 全局变量用于跟踪进度
 interrupted = False
+
+# 线程锁用于保护共享资源
+print_lock = Lock()
+result_lock = Lock()
 
 def signal_handler(signum, frame):
     """处理中断信号"""
@@ -262,6 +268,44 @@ def finalize_html_files(batch_mode=False):
     return 0
 
 
+def process_wav_file(wav_file, api_url, api_key, model, retry_count, retry_interval, html_files, delete_wav_after, file_index, total_files):
+    """处理单个WAV文件（用于并发处理）"""
+    global interrupted
+    
+    if interrupted:
+        return None, None, 0, 0
+    
+    file_name = os.path.basename(wav_file)
+    
+    # 转写音频
+    text = transcribe_audio(wav_file, api_url, api_key, model, retry_count, retry_interval)
+    
+    updated = 0
+    deleted = 0
+    
+    if text:
+        # 更新HTML文件（直接写入磁盘）
+        updated = update_html_files(html_files, file_name, text)
+        
+        # 根据配置决定是否删除原始音频文件
+        if delete_wav_after:
+            if delete_wav_file(wav_file):
+                deleted = 1
+        
+        # 输出结果（使用锁保证输出有序）
+        with print_lock:
+            print(f"  [{file_index}/{total_files}] {Colors.OKGREEN}✓{Colors.ENDC} {file_name}")
+            print(f"    {Colors.OKCYAN}→{Colors.ENDC} {text[:60]}{'...' if len(text) > 60 else ''}")
+        
+        return file_name, text, updated, deleted
+    else:
+        with print_lock:
+            print(f"  [{file_index}/{total_files}] {Colors.FAIL}✗{Colors.ENDC} {file_name}")
+            print(f"    {Colors.FAIL}→{Colors.ENDC} 转写失败")
+        
+        return file_name, None, 0, 0
+
+
 def transcribe_and_update(config, base_path):
     """转写WAV文件并立即更新HTML文件（实时保存）"""
     global interrupted
@@ -273,12 +317,14 @@ def transcribe_and_update(config, base_path):
     retry_count = config.getint('BASE', 'retry_count', fallback=3)
     retry_interval = config.getint('BASE', 'retry_interval', fallback=2)
     delete_wav_after = config.getboolean('BASE', 'delete_wav_after_transcribe', fallback=True)
+    concurrency = config.getint('BASE', 'concurrency', fallback=3)
     
     print_info(f"API URL: {api_url}")
     print_info(f"模型: {model}")
     print_info(f"重试次数: {retry_count}")
     print_info(f"重试间隔: {retry_interval} 秒")
     print_info(f"转写后删除原音频: {'是' if delete_wav_after else '否'}")
+    print_info(f"并发数: {concurrency}")
     
     # 获取HTML文件列表
     html_files = load_html_files(base_path)
@@ -298,37 +344,93 @@ def transcribe_and_update(config, base_path):
     updated_count = 0
     deleted_count = 0
     
-    for idx, wav_file in enumerate(wav_files, start=1):
-        # 检查是否被中断
-        if interrupted:
-            print_warning("检测到中断，停止处理")
-            break
+    total_files = len(wav_files)
+    
+    if concurrency > 1 and total_files > 1:
+        # 并发处理模式
+        print_section(f"开始并发处理")
+        print_info(f"并发数: {concurrency} 线程")
+        print_info(f"待处理文件: {total_files} 个")
+        print(f"\n{Colors.OKCYAN}正在处理中...{Colors.ENDC}")
+        print(f"{Colors.OKCYAN}{'-'*60}{Colors.ENDC}")
         
-        file_name = os.path.basename(wav_file)
-        print(f"\n[{idx}/{len(wav_files)}] 正在处理: {file_name}")
-        
-        # 转写音频
-        text = transcribe_audio(wav_file, api_url, api_key, model, retry_count, retry_interval)
-        
-        if text:
-            print_success(f"转写成功: {text[:50]}...")
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = {}
+            for idx, wav_file in enumerate(wav_files, start=1):
+                if interrupted:
+                    break
+                future = executor.submit(
+                    process_wav_file,
+                    wav_file, api_url, api_key, model,
+                    retry_count, retry_interval, html_files,
+                    delete_wav_after, idx, total_files
+                )
+                futures[future] = wav_file
             
-            # 立即更新HTML文件（直接写入磁盘）
-            updated = update_html_files(html_files, file_name, text)
-            if updated > 0:
-                updated_count += updated
+            # 收集结果
+            completed_count = 0
+            for future in as_completed(futures):
+                completed_count += 1
+                
+                if interrupted:
+                    executor.shutdown(wait=False)
+                    break
+                
+                try:
+                    file_name, text, updated, deleted = future.result()
+                    
+                    with result_lock:
+                        if text:
+                            success_count += 1
+                            updated_count += updated
+                            deleted_count += deleted
+                        else:
+                            failed_count += 1
+                except Exception as e:
+                    with print_lock:
+                        print_error(f"处理文件时发生异常: {e}")
+                    failed_count += 1
+        
+        print(f"\n{Colors.OKCYAN}{'-'*60}{Colors.ENDC}")
+    else:
+        # 串行处理模式
+        print_section(f"开始串行处理")
+        print_info(f"待处理文件: {total_files} 个")
+        print(f"\n{Colors.OKCYAN}正在处理中...{Colors.ENDC}")
+        print(f"{Colors.OKCYAN}{'-'*60}{Colors.ENDC}")
+        
+        for idx, wav_file in enumerate(wav_files, start=1):
+            # 检查是否被中断
+            if interrupted:
+                print_warning("检测到中断，停止处理")
+                break
             
-            # 根据配置决定是否删除原始音频文件
-            if delete_wav_after:
-                if delete_wav_file(wav_file):
-                    deleted_count += 1
+            file_name = os.path.basename(wav_file)
+            
+            # 转写音频
+            text = transcribe_audio(wav_file, api_url, api_key, model, retry_count, retry_interval)
+            
+            if text:
+                print(f"  [{idx}/{total_files}] {Colors.OKGREEN}✓{Colors.ENDC} {file_name}")
+                print(f"    {Colors.OKCYAN}→{Colors.ENDC} {text[:60]}{'...' if len(text) > 60 else ''}")
+                
+                # 立即更新HTML文件（直接写入磁盘）
+                updated = update_html_files(html_files, file_name, text)
+                if updated > 0:
+                    updated_count += updated
+                
+                # 根据配置决定是否删除原始音频文件
+                if delete_wav_after:
+                    if delete_wav_file(wav_file):
+                        deleted_count += 1
+                
+                success_count += 1
             else:
-                print_info(f"保留原始音频: {file_name}")
-            
-            success_count += 1
-        else:
-            print_error(f"转写失败，保留原始文件")
-            failed_count += 1
+                print(f"  [{idx}/{total_files}] {Colors.FAIL}✗{Colors.ENDC} {file_name}")
+                print(f"    {Colors.FAIL}→{Colors.ENDC} 转写失败")
+                failed_count += 1
+        
+        print(f"\n{Colors.OKCYAN}{'-'*60}{Colors.ENDC}")
     
     print(f"\n{Colors.OKCYAN}{'-'*60}{Colors.ENDC}")
     print_success(f"转写完成！")
