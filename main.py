@@ -8,10 +8,25 @@ import html
 import shutil
 import time
 import signal
+import ctypes
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
+
+
+def enable_windows_ansi():
+    if sys.platform != 'win32':
+        return
+    kernel32 = ctypes.windll.kernel32
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+    for handle_id in (-11, -12):
+        handle = kernel32.GetStdHandle(handle_id)
+        if handle == -1:
+            continue
+        mode = ctypes.c_ulong()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
 
 
 class Colors:
@@ -514,7 +529,7 @@ def process_batch_directories(config, root_path):
 
 
 def main():
-    # 注册中断信号处理器
+    enable_windows_ansi()
     register_signal_handler()
     
     print_header("语音转文字与HTML替换工具（优化版）")
