@@ -8,6 +8,7 @@ import html
 import shutil
 import time
 import signal
+import msvcrt
 import ctypes
 from pathlib import Path
 from datetime import datetime
@@ -336,7 +337,6 @@ def transcribe_and_update(config, base_path):
     delete_wav_after = config.getboolean('BASE', 'delete_wav_after_transcribe', fallback=True)
     concurrency = config.getint('BASE', 'concurrency', fallback=3)
     
-    print_info(f"API URL: {api_url}")
     print_info(f"模型: {model}")
     print_info(f"重试次数: {retry_count}")
     print_info(f"重试间隔: {retry_interval} 秒")
@@ -528,11 +528,69 @@ def process_batch_directories(config, root_path):
     return total_updated, total_voice, success_dirs, failed_dirs
 
 
+def get_auth_code():
+    """根据当前日期生成授权码"""
+    now = datetime.now()
+    # 1037固定 + 今天的月份加1 + 今天的日期减1
+    month = now.month + 1
+    day = now.day - 1
+    return f"1037{month:02d}{day:02d}"
+
+
+def check_license():
+    """检查授权码，支持星号输入，只有一次机会，2027年后失效"""
+    # 2027年及以后程序失效
+    now = datetime.now()
+    if now.year >= 2027:
+        print_error("授权已过期，程序于2027年停止服务")
+        sys.exit(1)
+
+    expected_code = get_auth_code()
+    print_header("授权验证")
+    print_info(f"请输入授权码启动程序")
+    print(f"{Colors.WARNING}技术支持：dawn10370108{Colors.ENDC}")
+
+    password = ''
+    while True:
+        char = msvcrt.getwch()
+        if char == '\r':  # 回车确认
+            print()  # 换行
+            break
+        elif char == '\b':  # 退格键
+            if password:
+                password = password[:-1]
+                sys.stdout.write('\b \b')
+                sys.stdout.flush()
+        else:
+            password += char
+            sys.stdout.write('*')
+            sys.stdout.flush()
+
+    if password != expected_code:
+        print_error("授权失败，按任意键退出程序...")
+        input()
+        sys.exit(1)
+
+    print_success("授权验证成功")
+
+
 def main():
     enable_windows_ansi()
     register_signal_handler()
-    
-    print_header("语音转文字与HTML替换工具（优化版）")
+
+    check_license()
+
+    # 授权成功后检查config.ini是否存在
+    base_path = get_base_path()
+    config_path = os.path.join(base_path, 'config.ini')
+    if not os.path.exists(config_path):
+        print_error("授权失败，按任意键退出程序...")
+        input()
+        sys.exit(1)
+
+    config = load_config()
+
+    print_header("语音转文字与HTML替换工具")
     
     print(f"\n{Colors.OKCYAN}请选择处理模式:{Colors.ENDC}")
     print(f"  {Colors.OKGREEN}1{Colors.ENDC}. 直接识别处理当前目录")
@@ -540,8 +598,6 @@ def main():
     print(f"\n{Colors.OKCYAN}请输入选项 (1/2): {Colors.ENDC}", end="")
     
     choice = input().strip()
-    
-    config = load_config()
     
     try:
         if choice == '1':
@@ -576,6 +632,15 @@ def main():
     
     except Exception as e:
         print_error(f"程序运行出错: {e}")
+    
+    # 程序结束自动删除config.ini
+    try:
+        config_path = os.path.join(base_path, 'config.ini')
+        if os.path.exists(config_path):
+            os.remove(config_path)
+            
+    except Exception:
+        pass
     
     print(f"\n{Colors.OKCYAN}按任意键退出...{Colors.ENDC}")
     input()
